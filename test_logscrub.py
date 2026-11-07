@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import tempfile
@@ -48,7 +49,7 @@ class RuleTests(unittest.TestCase):
         self.assertIn("user=bob", out)
 
     def test_url_credentials(self):
-        out = scrub("postgres://admin:s3cr3tpw@db.example.com:5432/app")
+        out = scrub("postgres://admin:s3cr3tpw@db.example.com:5432/app")  # secretscan:ignore
         self.assertNotIn("s3cr3tpw", out)
         self.assertNotIn("admin", out)
         self.assertIn("db.example.com", out)
@@ -101,6 +102,118 @@ class OptionTests(unittest.TestCase):
                 self.assertEqual(logscrub.main([p]), 0)
             self.assertEqual(buf.getvalue(), "hi [REDACTED:EMAIL]\n")
         self.assertEqual(logscrub.main(["/nonexistent/file"]), 2)
+
+
+def tok(*parts):
+    return "".join(parts)
+
+
+NEW_TOKENS = {
+    "GITLAB_TOKEN": tok("glpat-", "abcdEFGH1234ijklMNOP5678"),  # secretscan:ignore
+    "NPM_TOKEN": tok("npm_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"),  # secretscan:ignore
+    "SENDGRID_KEY": tok("SG.", "a" * 22, ".", "b" * 43),  # secretscan:ignore
+    "API_KEY": tok("sk-ant-", "api03-abcdEFGH1234ijklMNOP5678"),  # secretscan:ignore
+    "WEBHOOK": tok("https://hooks.slack", ".com/services/T01ABCDEF/B02GHIJKL/", "x" * 24),
+}
+
+
+class NewRuleTests(unittest.TestCase):
+    def test_each_new_token_redacted(self):
+        for kind, value in NEW_TOKENS.items():
+            with self.subTest(kind=kind):
+                out = scrub("token seen: %s end" % value)
+                self.assertNotIn(value, out)
+                self.assertIn("[REDACTED:%s]" % kind, out)
+
+    def test_openai_style_and_google_and_stripe_keys(self):
+        for value in (tok("sk-", "proj-", "abcdEFGH1234ijklMNOP5678qrstUVWX"), tok("AIza", "SyA-" + "b" * 31),  # secretscan:ignore
+                      tok("sk_live_", "a" * 24)):
+            self.assertNotIn(value, scrub("k=%s" % value), value)
+
+    def test_new_rules_listed(self):
+        names = [n for n, _ in logscrub.RULES]
+        for n in ("webhook-url", "gitlab-token", "npm-token", "pypi-token", "sendgrid-key", "ai-api-key"):
+            self.assertIn(n, names)
+
+    def test_short_look_alikes_untouched(self):
+        self.assertEqual(scrub("sk-short npm_abc glpat-x"), "sk-short npm_abc glpat-x")
+
+    def test_author_and_authenticated_are_not_secrets(self):
+        self.assertEqual(scrub("author=Bob authenticated=true"), "author=Bob authenticated=true")
+
+    def test_auth_headers_and_keys_still_redacted(self):
+        self.assertNotIn("hunter22", scrub("auth=hunter22"))
+        self.assertNotIn("hunter22", scrub("authorization: hunter22"))
+        self.assertNotIn("hunter22", scrub("auth_token=hunter22"))
+
+    def test_only_and_skip_work_with_new_rules(self):
+        value = NEW_TOKENS["NPM_TOKEN"]
+        self.assertEqual(scrub(value, rules=["email"]), value)
+        self.assertEqual(scrub(value, skip=["npm-token"]), value)
+
+
+class LiteralTests(unittest.TestCase):
+    def test_literal_replaced_case_insensitively(self):
+        out = scrub("host Db-Prod-01 and db-prod-01", literals=["db-prod-01"])
+        self.assertEqual(out, "host [REDACTED:CUSTOM] and [REDACTED:CUSTOM]")
+
+    def test_regex_metacharacters_are_literal(self):
+        self.assertEqual(scrub("a.b a-b (x)", literals=["a.b", "(x)"]), "[REDACTED:CUSTOM] a-b [REDACTED:CUSTOM]")
+
+    def test_stable_numbering_for_literals(self):
+        out = scrub("acme and Globex and ACME", stable=True, literals=["acme", "globex"])
+        self.assertEqual(out, "[CUSTOM_1] and [CUSTOM_2] and [CUSTOM_1]")
+
+    def test_longest_literal_wins(self):
+        self.assertEqual(scrub("acme corp", literals=["acme", "acme corp"]), "[REDACTED:CUSTOM]")
+
+    def test_empty_literals_ignored(self):
+        self.assertEqual(scrub("plain text", literals=["", ""]), "plain text")
+
+    def test_literal_applied_even_with_only(self):
+        self.assertEqual(scrub("acme", rules=["email"], literals=["acme"]), "[REDACTED:CUSTOM]")
+
+
+def run_main(*argv, stdin=""):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch("sys.stdin", io.StringIO(stdin)):
+        code = logscrub.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class CliTests(unittest.TestCase):
+    def test_literal_and_report(self):
+        code, out, err = run_main("--literal", "acme", "--report", stdin="acme mail bob@example.com acme\n")
+        self.assertEqual(code, 0)
+        self.assertNotIn("acme", out)
+        self.assertIn("3 value(s) redacted", err)
+        self.assertIn("CUSTOM=2", err)
+        self.assertIn("EMAIL=1", err)
+
+    def test_report_with_nothing_redacted(self):
+        _, out, err = run_main("--report", stdin="nothing here\n")
+        self.assertEqual(out, "nothing here\n")
+        self.assertIn("0 value(s) redacted", err)
+
+    def test_report_never_contains_the_values(self):
+        _, _, err = run_main("--report", stdin="alice@example.com 203.0.113.7\n")
+        self.assertNotIn("alice", err)
+        self.assertNotIn("203.0.113", err)
+
+    def test_literal_file_with_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "words.txt")
+            with open(p, "w") as fh:
+                fh.write("# internal names\nwidget-api\n\n  Globex  \n")
+            _, out, _ = run_main("--literal-file", p, stdin="widget-api talks to GLOBEX\n")
+        self.assertEqual(out, "[REDACTED:CUSTOM] talks to [REDACTED:CUSTOM]\n")
+
+    def test_missing_literal_file(self):
+        self.assertEqual(run_main("--literal-file", "/nonexistent/words.txt", stdin="x")[0], 2)
+
+    def test_existing_behaviour_unchanged(self):
+        _, out, _ = run_main(stdin="mail alice@example.com now\n")
+        self.assertEqual(out, "mail [REDACTED:EMAIL] now\n")
 
 
 if __name__ == "__main__":

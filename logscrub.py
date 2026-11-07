@@ -8,11 +8,12 @@ report, a support ticket or an AI assistant. Standard library only.
     python3 logscrub.py app.log --stable > app.scrubbed.log
 """
 import argparse
+import collections
 import ipaddress
 import re
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 PRIVATE_KEY = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)
@@ -20,10 +21,20 @@ JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{3
 BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
 KV_SECRET = re.compile(
     r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|"
-    r"auth|credential)[A-Za-z0-9_.-]*)(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)")
+    r"auth(?!or(?!iz)|enticat)|credential)[A-Za-z0-9_.-]*)(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)")
 AWS_KEY = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 GITHUB_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b")
 SLACK_TOKEN = re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")
+GITLAB_TOKEN = re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b")
+NPM_TOKEN = re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")
+PYPI_TOKEN = re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}\b")
+SENDGRID_KEY = re.compile(r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b")
+AI_KEY = re.compile(r"\bsk-(?:ant-)?(?:proj-)?[A-Za-z0-9_-]{20,}\b")
+GOOGLE_KEY = re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
+STRIPE_KEY = re.compile(r"\b[sr]k_live_[0-9a-zA-Z]{24,}\b")
+WEBHOOK = re.compile(
+    r"https://(?:hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]{20,}|"
+    r"(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_-]{50,})")
 URL_CREDS = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@")
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 IPV4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
@@ -47,13 +58,18 @@ def luhn_ok(digits):
 
 
 class Scrubber:
-    def __init__(self, stable=False, rules=None, skip=()):
+    def __init__(self, stable=False, rules=None, skip=(), literals=()):
         self.stable = stable
         self.seen = {}
+        self.counts = collections.Counter()
+        # user-supplied words (internal hostnames, customer names); longest first so overlaps resolve sensibly
+        words = sorted({w for w in literals if w}, key=len, reverse=True)
+        self.literal_rx = re.compile("|".join(re.escape(w) for w in words), re.I) if words else None
         names = [n for n, _ in RULES]
         self.active = [n for n in (rules or names) if n in names and n not in set(skip)]
 
     def tag(self, kind, value):
+        self.counts[kind] += 1
         if not self.stable:
             return "[REDACTED:%s]" % kind
         key = (kind, value)
@@ -63,6 +79,8 @@ class Scrubber:
         return "[%s_%d]" % (kind, self.seen[key])
 
     def scrub(self, text):
+        if self.literal_rx is not None:
+            text = self.literal_rx.sub(lambda m: self.tag("CUSTOM", m.group(0).lower()), text)
         for name, fn in RULES:
             if name in self.active:
                 text = fn(self, text)
@@ -129,6 +147,14 @@ RULES = [
     ("aws-key", _simple("AWS_KEY", AWS_KEY)),
     ("github-token", _simple("GITHUB_TOKEN", GITHUB_TOKEN)),
     ("slack-token", _simple("SLACK_TOKEN", SLACK_TOKEN)),
+    ("webhook-url", _simple("WEBHOOK", WEBHOOK)),
+    ("gitlab-token", _simple("GITLAB_TOKEN", GITLAB_TOKEN)),
+    ("npm-token", _simple("NPM_TOKEN", NPM_TOKEN)),
+    ("pypi-token", _simple("PYPI_TOKEN", PYPI_TOKEN)),
+    ("sendgrid-key", _simple("SENDGRID_KEY", SENDGRID_KEY)),
+    ("ai-api-key", _simple("API_KEY", AI_KEY)),
+    ("google-api-key", _simple("API_KEY", GOOGLE_KEY)),
+    ("stripe-key", _simple("API_KEY", STRIPE_KEY)),
     ("key-value-secret", _kv),
     ("email", _simple("EMAIL", EMAIL)),
     ("card", _card),
@@ -146,6 +172,10 @@ def main(argv=None):
                     help="same value gets same numbered placeholder, e.g. [EMAIL_1]")
     ap.add_argument("--only", help="comma-separated rule names to apply")
     ap.add_argument("--skip", default="", help="comma-separated rule names to skip")
+    ap.add_argument("--literal", action="append", default=[], metavar="TEXT",
+                    help="also redact this exact text, case-insensitively (internal host, customer name); repeatable")
+    ap.add_argument("--literal-file", metavar="FILE", help="file with one literal per line (# comments ok)")
+    ap.add_argument("--report", action="store_true", help="print how many values of each kind were redacted to stderr")
     ap.add_argument("--list-rules", action="store_true")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
@@ -153,7 +183,15 @@ def main(argv=None):
         print("\n".join(n for n, _ in RULES))
         return 0
     only = args.only.split(",") if args.only else None
-    sc = Scrubber(args.stable, only, [x for x in args.skip.split(",") if x])
+    literals = list(args.literal)
+    if args.literal_file:
+        try:
+            with open(args.literal_file, encoding="utf-8", errors="replace") as fh:
+                literals += [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
+        except OSError as exc:
+            print("logscrub: %s" % exc, file=sys.stderr)
+            return 2
+    sc = Scrubber(args.stable, only, [x for x in args.skip.split(",") if x], literals)
     try:
         if args.file == "-":
             text = sys.stdin.read()
@@ -164,6 +202,10 @@ def main(argv=None):
         print("logscrub: %s" % exc, file=sys.stderr)
         return 2
     sys.stdout.write(sc.scrub(text))
+    if args.report:
+        total = sum(sc.counts.values())
+        detail = ", ".join("%s=%d" % (k, v) for k, v in sorted(sc.counts.items()))
+        print("logscrub: %d value(s) redacted%s" % (total, " (%s)" % detail if detail else ""), file=sys.stderr)
     return 0
 
 
